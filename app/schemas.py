@@ -1,6 +1,6 @@
 """Pydantic request models and definition-spec validation."""
 
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -40,6 +40,15 @@ class ParseRequest(BaseModel):
     device_type: str
     version: Optional[str] = None  # omitted -> latest active version
     hex: str = Field(min_length=2)
+
+
+class EncodeRequest(BaseModel):
+    device_type: str
+    version: Optional[str] = None  # omitted -> latest active version
+    # values use the parse-response types: int/float for uint/int (scaled fields
+    # accept floats), bool for bool, "0x.." string for hex, string for ascii.
+    # The checksum field must not be provided; it is computed automatically.
+    values: Dict[str, Any] = Field(default_factory=dict)
 
 
 def validate_definition(defn: DefinitionCreate) -> None:

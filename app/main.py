@@ -7,8 +7,9 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 
 from . import database
+from .encoder import EncodeError, encode_message
 from .parser import ParseError, parse_message
-from .schemas import DefinitionCreate, ParseRequest, validate_definition
+from .schemas import DefinitionCreate, EncodeRequest, ParseRequest, validate_definition
 
 
 @asynccontextmanager
@@ -111,24 +112,31 @@ def deactivate_definition(device_type: str, version: str):
 _HEX_CLEANER = re.compile(r"(0[xX])|[\s_-]")
 
 
+def _select_definition(device_type: str, version: Optional[str]) -> dict:
+    """Shared by /parse and /encode: an explicit version selects that definition
+    (even if inactive); otherwise the latest active version is used."""
+    if version:
+        record = database.get_definition(device_type, version)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"definition '{device_type}' version '{version}' not found",
+            )
+    else:
+        record = database.get_latest(device_type, active_only=True)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no active definition found for device type '{device_type}'",
+            )
+    return record
+
+
 @app.post("/api/v1/parse")
 def parse(req: ParseRequest):
     """Parse a hex payload against a definition (latest active version unless
     an explicit version is given)."""
-    if req.version:
-        record = database.get_definition(req.device_type, req.version)
-        if record is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"definition '{req.device_type}' version '{req.version}' not found",
-            )
-    else:
-        record = database.get_latest(req.device_type, active_only=True)
-        if record is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"no active definition found for device type '{req.device_type}'",
-            )
+    record = _select_definition(req.device_type, req.version)
 
     cleaned = _HEX_CLEANER.sub("", req.hex)
     if not cleaned:
@@ -144,6 +152,26 @@ def parse(req: ParseRequest):
     try:
         result = parse_message(record["fields"], record["checksum"], data)
     except ParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "device_type": record["device_type"],
+        "version": record["version"],
+        "definition_active": record["active"],
+        **result,
+    }
+
+
+@app.post("/api/v1/encode")
+def encode(req: EncodeRequest):
+    """Encode field values into a hex payload (latest active version unless an
+    explicit version is given). Conditions are evaluated on raw values; the
+    checksum field is computed automatically and must not be provided."""
+    record = _select_definition(req.device_type, req.version)
+
+    try:
+        result = encode_message(record["fields"], record["checksum"], req.values)
+    except EncodeError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
     return {
