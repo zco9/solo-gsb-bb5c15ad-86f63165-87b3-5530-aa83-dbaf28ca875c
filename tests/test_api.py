@@ -239,3 +239,379 @@ def test_get_definition_and_404s():
     assert client.get("/api/v1/definitions/temp_sensor/9.9.9").status_code == 404
     assert client.get("/api/v1/definitions/ghost/latest").status_code == 404
     assert client.post("/api/v1/definitions/ghost/1.0.0/deactivate").status_code == 404
+
+
+# ---------- encode ----------
+
+SIGNED_DEF = {
+    "device_type": "signed_dev",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "temp", "type": "int", "bit_length": 16,
+         "endianness": "little", "scale": 0.1},
+        {"name": "delta", "type": "int", "bit_length": 8},
+    ],
+}
+
+MIXED_DEF = {
+    "device_type": "mixed_dev",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "preamble", "type": "hex", "bit_length": 16},
+        {"name": "code", "type": "ascii", "bit_length": 16},
+        {"name": "enabled", "type": "bool", "bit_length": 1},
+        {"name": "level", "type": "uint", "bit_length": 3},
+        {"name": "mode", "type": "uint", "bit_length": 4},
+        {"name": "gain", "type": "uint", "bit_length": 8, "scale": 0.5, "offset": -1.0},
+    ],
+}
+
+NIBBLE_DEF = {
+    "device_type": "nibble_dev",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "hi", "type": "uint", "bit_length": 4},
+        {"name": "lo", "type": "uint", "bit_length": 4},
+        {"name": "tail", "type": "uint", "bit_length": 4},
+    ],
+}
+
+MISALIGNED_DEF = {
+    "device_type": "misaligned_dev",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "nib", "type": "uint", "bit_length": 4},
+        {"name": "chk", "type": "uint", "bit_length": 8},
+    ],
+    "checksum": {"field": "chk", "algorithm": "sum8"},
+}
+
+
+def _register_ok(payload):
+    resp = client.post("/api/v1/definitions", json=payload)
+    assert resp.status_code in (201, 409), resp.text
+
+
+def test_encode_temperature_branch_roundtrip():
+    _register_ok(SENSOR_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "temp_sensor",
+            "version": "1.0.0",
+            "values": {"header": 0xAA, "msg_type": 1, "flags": 0, "temperature": 23.5},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # crc computed automatically; identical to a hand-built message
+    assert data["hex"] == make_message(bytes([0xAA, 0x10, 0xEB, 0x00]))
+    assert data["encoded_bits"] == 48
+    assert data["padded_bits"] == 0
+    assert data["checksum"]["algorithm"] == "crc16-ccitt"
+    assert data["checksum"]["range"] == "bytes [0, 4)"
+
+    fields = {f["name"]: f for f in data["fields"]}
+    assert fields["temperature"]["value"] == 23.5
+    assert fields["temperature"]["raw_value"] == 235
+    assert fields["temperature"]["bit_offset"] == 16
+    assert "humidity" not in fields  # branch not taken, not required
+
+    branch = {b["field"]: b for b in data["branch_path"]}
+    assert branch["temperature"]["matched"] is True
+    assert branch["temperature"]["action"] == "encoded"
+    assert branch["humidity"]["matched"] is False
+    assert branch["humidity"]["action"] == "skipped"
+
+    # round-trip: parsing the encoded hex yields the same values
+    again = client.post(
+        "/api/v1/parse",
+        json={"device_type": "temp_sensor", "hex": data["hex"]},
+    )
+    assert again.status_code == 200
+    parsed = {f["name"]: f for f in again.json()["fields"]}
+    assert parsed["temperature"]["value"] == 23.5
+    assert again.json()["checksum"]["valid"] is True
+
+
+def test_encode_humidity_branch_and_ignored_skipped_value():
+    _register_ok(SENSOR_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "temp_sensor",
+            "values": {"header": 0xAA, "msg_type": 2, "flags": 0, "humidity": 0x55},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hex"] == make_message(bytes([0xAA, 0x20, 0x55]))
+
+    # a value for a skipped branch field is ignored (with a warning), not an error
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "temp_sensor",
+            "values": {
+                "header": 0xAA, "msg_type": 2, "flags": 0,
+                "humidity": 0x55, "temperature": 99.9,
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["hex"] == make_message(bytes([0xAA, 0x20, 0x55]))
+    assert any("temperature" in w for w in data["warnings"])
+
+
+def test_encode_missing_matched_field_422():
+    _register_ok(SENSOR_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "temp_sensor",
+            "values": {"header": 0xAA, "msg_type": 1, "flags": 0},  # temperature missing
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_encode_unknown_field_422():
+    _register_ok(SENSOR_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "temp_sensor",
+            "values": {"header": 0xAA, "msg_type": 2, "flags": 0, "humidity": 1, "ghost": 1},
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_encode_checksum_field_not_accepted():
+    _register_ok(SENSOR_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "temp_sensor",
+            "values": {
+                "header": 0xAA, "msg_type": 2, "flags": 0, "humidity": 1, "crc": 0x1234,
+            },
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_encode_out_of_range_422():
+    _register_ok(SENSOR_DEF)
+    base = {"header": 0xAA, "msg_type": 2, "flags": 0, "humidity": 0x55}
+    for bad in ({"humidity": 256}, {"flags": 16}, {"header": -1}):
+        resp = client.post(
+            "/api/v1/encode",
+            json={"device_type": "temp_sensor", "values": {**base, **bad}},
+        )
+        assert resp.status_code == 422, bad
+
+
+def test_encode_unrepresentable_scaled_value_422():
+    _register_ok(SENSOR_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "temp_sensor",
+            # 23.55 -> raw 235.5 is not an integer
+            "values": {"header": 0xAA, "msg_type": 1, "flags": 0, "temperature": 23.55},
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_encode_signed_twos_complement_and_little_endian():
+    _register_ok(SIGNED_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "signed_dev", "values": {"temp": -5.0, "delta": -1}},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # temp raw = -50 -> 0xFFCE little-endian -> CE FF; delta -1 -> FF
+    assert data["hex"] == "ceffff"
+    fields = {f["name"]: f for f in data["fields"]}
+    assert fields["temp"]["raw_value"] == -50
+    assert fields["delta"]["raw_value"] == -1
+
+    again = client.post("/api/v1/parse", json={"device_type": "signed_dev", "hex": data["hex"]})
+    parsed = {f["name"]: f for f in again.json()["fields"]}
+    assert parsed["temp"]["value"] == -5.0
+    assert parsed["delta"]["value"] == -1
+
+    # int8 range is [-128, 127]
+    for bad in ({"delta": 128}, {"delta": -129}, {"temp": 3276.8}):
+        values = {"temp": 0, "delta": 0, **bad}
+        resp = client.post(
+            "/api/v1/encode", json={"device_type": "signed_dev", "values": values}
+        )
+        assert resp.status_code == 422, bad
+
+
+def test_encode_mixed_types_roundtrip():
+    _register_ok(MIXED_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={
+            "device_type": "mixed_dev",
+            "values": {
+                "preamble": "0xABCD",
+                "code": "OK",
+                "enabled": True,
+                "level": 5,
+                "mode": 2,
+                "gain": 2.5,  # raw = (2.5 - (-1.0)) / 0.5 = 7
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # 16+16 bits, then 1|101|0010 -> 0xD2, then 00000111 -> 0x07
+    assert data["hex"] == "abcd4f4bd207"
+    fields = {f["name"]: f for f in data["fields"]}
+    assert fields["preamble"]["value"] == "0xabcd"
+    assert fields["enabled"]["value"] is True
+    assert fields["gain"]["raw_value"] == 7
+
+    again = client.post("/api/v1/parse", json={"device_type": "mixed_dev", "hex": data["hex"]})
+    parsed = {f["name"]: f for f in again.json()["fields"]}
+    assert parsed["code"]["value"] == "OK"
+    assert parsed["enabled"]["value"] is True
+    assert parsed["level"]["value"] == 5
+    assert parsed["gain"]["value"] == 2.5
+
+
+def test_encode_mixed_type_validation():
+    _register_ok(MIXED_DEF)
+    base = {
+        "preamble": "0xABCD", "code": "OK", "enabled": True,
+        "level": 5, "mode": 2, "gain": 2.5,
+    }
+    bad_values = [
+        {"preamble": "0xFFFFF"},   # does not fit in 16 bits
+        {"preamble": "not-hex"},
+        {"code": "TOOLONG"},       # must be exactly 2 chars
+        {"code": "中文"},           # not ASCII
+        {"enabled": "yes"},
+        {"level": 8},              # 3 bits max 7
+    ]
+    for bad in bad_values:
+        resp = client.post(
+            "/api/v1/encode",
+            json={"device_type": "mixed_dev", "values": {**base, **bad}},
+        )
+        assert resp.status_code == 422, bad
+
+
+def test_encode_non_byte_aligned_padding():
+    _register_ok(NIBBLE_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "nibble_dev", "values": {"hi": 0xA, "lo": 0xB, "tail": 0xC}},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["hex"] == "abc0"  # 12 bits + 4 zero padding bits
+    assert data["encoded_bits"] == 12
+    assert data["padded_bits"] == 4
+    assert data["message_bits"] == 16
+    assert data["warnings"]
+
+
+def test_encode_checksum_not_byte_aligned_422():
+    _register_ok(MISALIGNED_DEF)
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "misaligned_dev", "values": {"nib": 1}},
+    )
+    assert resp.status_code == 422
+
+
+def test_encode_sum8_checksum_auto_computed():
+    _register_ok({
+        "device_type": "sum8_dev",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "a", "type": "uint", "bit_length": 8},
+            {"name": "b", "type": "uint", "bit_length": 8},
+            {"name": "chk", "type": "uint", "bit_length": 8},
+        ],
+        "checksum": {"field": "chk", "algorithm": "sum8"},
+    })
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "sum8_dev", "values": {"a": 0x10, "b": 0x20}},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["hex"] == "102030"
+    assert data["checksum"]["calculated"] == 0x30
+    fields = {f["name"]: f for f in data["fields"]}
+    assert fields["chk"]["value"] == 0x30
+
+
+def test_encode_version_selection_and_deactivate():
+    _register_ok({
+        "device_type": "enc_meter", "version": "1.0.0",
+        "fields": [{"name": "val", "type": "uint", "bit_length": 8}],
+    })
+    _register_ok({
+        "device_type": "enc_meter", "version": "2.0.0",
+        "fields": [
+            {"name": "val", "type": "uint", "bit_length": 8},
+            {"name": "extra", "type": "uint", "bit_length": 8},
+        ],
+    })
+
+    # latest active (2.0.0) is used when version is omitted
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "enc_meter", "values": {"val": 1, "extra": 2}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["version"] == "2.0.0"
+    assert resp.json()["hex"] == "0102"
+
+    # ... and its required fields are enforced
+    resp = client.post("/api/v1/encode", json={"device_type": "enc_meter", "values": {"val": 1}})
+    assert resp.status_code == 422
+
+    # explicit older version
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "enc_meter", "version": "1.0.0", "values": {"val": 1}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["hex"] == "01"
+
+    # after deactivating 2.0.0, latest falls back to 1.0.0
+    client.post("/api/v1/definitions/enc_meter/2.0.0/deactivate")
+    resp = client.post(
+        "/api/v1/encode", json={"device_type": "enc_meter", "values": {"val": 7}}
+    )
+    assert resp.json()["version"] == "1.0.0"
+    assert resp.json()["hex"] == "07"
+
+    # explicit-version encode of an inactive definition still works
+    resp = client.post(
+        "/api/v1/encode",
+        json={"device_type": "enc_meter", "version": "2.0.0", "values": {"val": 1, "extra": 2}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["definition_active"] is False
+    assert resp.json()["hex"] == "0102"
+
+
+def test_encode_unknown_device_404():
+    assert client.post(
+        "/api/v1/encode", json={"device_type": "nope", "values": {"a": 1}}
+    ).status_code == 404
+    assert client.post(
+        "/api/v1/encode",
+        json={"device_type": "temp_sensor", "version": "9.9.9", "values": {}},
+    ).status_code == 404
